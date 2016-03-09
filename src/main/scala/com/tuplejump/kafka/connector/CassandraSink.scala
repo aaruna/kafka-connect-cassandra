@@ -18,63 +18,27 @@ package com.tuplejump.kafka.connector
 
 import java.util.{List => JList, Map => JMap}
 
+import scala.collection.immutable
 import scala.collection.JavaConverters._
 import org.apache.kafka.connect.connector.Task
-import org.apache.kafka.connect.errors.ConnectException
 import org.apache.kafka.connect.sink.SinkConnector
-import CassandraConnectorConfig._
+import org.apache.kafka.common.config.ConfigException
+import org.apache.kafka.connect.errors.ConnectException
 
-class CassandraSink extends SinkConnector {
-
-  private var configProperties = Map.empty[String, String].asJava
+class CassandraSink extends SinkConnector with ConnectorLike {
 
   override def taskClass: Class[_ <: Task] = classOf[CassandraSinkTask]
 
-  override def taskConfigs(maxTasks: Int): JList[JMap[String, String]] = {
-    List.fill(maxTasks)(configProperties).asJava
-  }
+  override def taskConfigs(maxTasks: Int): JList[JMap[String, String]] =
+    List.fill(maxTasks)(topics.config.asJava).asJava
 
-  override def stop(): Unit = {}
+  override def stop(): Unit = ()
 
-  override def start(props: JMap[String, String]): Unit = {
-    if (isValidConfig(props)) {
-      configProperties = props
-    } else {
-      throw new ConnectException(
-        s"""Couldn't start CassandraSink due to configuration error.`topics` property cannot be empty and
-            |there should be a `<topicName>_table` key whose value is `<keyspace>.<tableName>` for every topic.""".stripMargin)
+  override def start(config: JMap[String, String]): Unit =
+    try configure(immutable.Map.empty[String,String] ++ config.asScala) catch {
+      case e: ConfigException => throw new ConnectException(e)
     }
-  }
 
-  override def version(): String = CassandraConnectorInfo.version
+  override def version: String = CassandraConnectorInfo.version
 
-  private def isValidConfig(config: JMap[String, String]): Boolean = {
-    val topics: String = config.getOrDefault(SinkConnector.TOPICS_CONFIG, "")
-    topics.nonEmpty && topics.split(TopicSeparator).forall {
-      x =>
-        val key = tableConfig(x)
-        val value = Option(config.get(key))
-        value.isDefined && value.get.split("\\.").length == 2
-    }
-  }
-}
-
-class CassandraConnectorException(msg: String) extends RuntimeException(msg)
-
-object CassandraConnectorConfig {
-  val HostConfig = "host"
-  val PortConfig = "port"
-
-  val DefaultHost = "localhost"
-  val DefaultPort = "9042"
-
-  val TopicSeparator = ","
-
-  def tableConfig(topic: String): String = {
-    if (Option(topic).isDefined && topic.trim.nonEmpty) {
-      s"${topic.trim}_table"
-    } else {
-      throw new CassandraConnectorException("Topic name missing")
-    }
-  }
 }

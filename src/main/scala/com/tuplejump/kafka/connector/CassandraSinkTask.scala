@@ -16,82 +16,58 @@
 
 package com.tuplejump.kafka.connector
 
-import java.util.{Collection => JCollection, Map => JMap, Date}
+import java.util.{Collection => JCollection, Map => JMap}
 
-import scala.collection.JavaConversions._
+import scala.collection.immutable
 import scala.collection.JavaConverters._
-import com.datastax.driver.core.{Cluster, Session}
+import com.datastax.driver.core.Session
 import org.apache.kafka.clients.consumer.OffsetAndMetadata
 import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.connect.data.Schema.Type._
-import org.apache.kafka.connect.data.{Timestamp, Schema, Struct}
 import org.apache.kafka.connect.sink.{SinkRecord, SinkTask}
-import com.tuplejump.kafka.connector.CassandraConnectorConfig._
+import org.apache.kafka.connect.errors.ConnectException
 
-class CassandraSinkTask extends SinkTask {
-  private var maybeSession: Option[Session] = None
-  private var configProperties: JMap[String, String] = Map.empty[String, String].asJava
+class CassandraSinkTask extends SinkTask with ConnectorLike {
+  import KafkaCassandraProtocol._
 
-  def getSession = maybeSession
+  private var cluster: Option[CassandraCluster] = None
 
-  override def stop(): Unit = {
-    maybeSession.map(_.getCluster.close())
-  }
+  private var _session: Option[Session] = None
 
-  override def put(records: JCollection[SinkRecord]): Unit = {
-    maybeSession match {
-      case Some(session) =>
-        records.foreach {
-          r =>
-            val query = DataConverter.sinkRecordToQuery(r, configProperties)
-            session.execute(query)
-        }
-      case None =>
-        throw new CassandraConnectorException("Failed to get cassandra session.")
+  sys.runtime.addShutdownHook(new Thread(s"Shutting down any open cassandra sessions.") {
+    override def run(): Unit = shutdown()
+  })
+
+  def session: Session = _session.getOrElse(throw new IllegalStateException(
+    "Sink has not been started yet or is not configured properly to connect to a cluster."))
+
+  override def stop(): Unit = shutdown()
+
+  override def put(records: JCollection[SinkRecord]): Unit =
+    records.asScala.foreach { record =>
+      topics.find(record.topic) match {
+        case Some(topic) =>
+          val command = CassandraWrite(record, topic)
+          session.execute(command.value)
+        case other =>
+          throw new ConnectException("Failed to get cassandra session.")
+      }
     }
-  }
 
   //This method is not relevant as we insert every received record in Cassandra
-  override def flush(offsets: JMap[TopicPartition, OffsetAndMetadata]): Unit = {}
+  override def flush(offsets: JMap[TopicPartition, OffsetAndMetadata]): Unit = ()
 
-  override def start(props: JMap[String, String]): Unit = {
-    configProperties = props
-    val host = configProperties.getOrDefault(HostConfig, DefaultHost)
-    val port = configProperties.getOrDefault(PortConfig, DefaultPort).toInt
-    val cluster = Cluster.builder().addContactPoint(host).withPort(port)
-    maybeSession = Some(cluster.build().connect())
+  override def start(properties: JMap[String, String]): Unit = {
+    val config = immutable.Map.empty[String,String] ++ properties.asScala
+    configure(config)
+
+    val cassandraCluster = CassandraCluster(config)
+    _session = Some(cassandraCluster.connect)
+    cluster = Some(cassandraCluster)
   }
 
-  override def version(): String = CassandraConnectorInfo.version
-}
+  override def version: String = CassandraConnectorInfo.version
 
-object DataConverter {
-
-  //TODO use keySchema, partition and kafkaOffset
-  def sinkRecordToQuery(sinkRecord: SinkRecord, props: JMap[String, String]): String = {
-    val valueSchema = sinkRecord.valueSchema()
-    val columnNames = valueSchema.fields().map(_.name()).distinct
-
-    val keyName = tableConfig(sinkRecord.topic())
-    val tableName = props.get(keyName)
-    val columnValueString = valueSchema.`type`() match {
-      case STRUCT =>
-        val result: Struct = sinkRecord.value().asInstanceOf[Struct]
-        columnNames.map { col =>
-          val colValue = result.get(col).toString
-          val colSchema = valueSchema.field(col).schema()
-          //TODO ensure all types are supported
-          colSchema match {
-            case x if x.`type`() == Schema.STRING_SCHEMA.`type`() =>
-              s"'$colValue'"
-            case x if x.name() == Timestamp.LOGICAL_NAME =>
-              val time = Timestamp.fromLogical(x, result.get(col).asInstanceOf[Date])
-              s"$time"
-            case y =>
-              colValue
-          }
-        }.mkString(",")
-    }
-    s"INSERT INTO $tableName(${columnNames.mkString(",")}) VALUES($columnValueString)"
+  private def shutdown(): Unit = {
+    cluster foreach(_.shutdown())
   }
 }
